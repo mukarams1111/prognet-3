@@ -39,6 +39,8 @@ public class PrimaryController {
    @FXML
    private TableColumn<DownloadItem, DownloadItem> progressColumn;
    @FXML
+   private TableColumn<DownloadItem, String> sizeColumn;
+   @FXML
    private TableColumn<DownloadItem, String> speedColumn;
    @FXML
    private TableColumn<DownloadItem, String> etaColumn;
@@ -81,6 +83,7 @@ public class PrimaryController {
 
       nameColumn.setCellValueFactory(cd -> cd.getValue().fileNameProperty());
       statusColumn.setCellValueFactory(cd -> cd.getValue().statusTextProperty());
+      sizeColumn.setCellValueFactory(cd -> cd.getValue().sizeTextProperty());
       speedColumn.setCellValueFactory(cd -> cd.getValue().speedProperty());
       etaColumn.setCellValueFactory(cd -> cd.getValue().etaProperty());
 
@@ -88,7 +91,7 @@ public class PrimaryController {
       progressColumn.setCellFactory(col -> new TableCell<>() {
          private final ProgressBar pb = new ProgressBar(0);
          {
-            pb.setPrefWidth(180);
+            pb.setPrefWidth(160);
             pb.setMaxWidth(Double.MAX_VALUE);
          }
 
@@ -194,23 +197,19 @@ public class PrimaryController {
          }
       });
 
-      // ---- RESTORE ----
+      // Restore
       List<DownloadItem> restored = storage.load();
-      for (DownloadItem it : restored) {
+      for (DownloadItem it : restored)
          registerItem(it, false);
-      }
       if (!restored.isEmpty()) {
          System.out.println("Restored " + restored.size() + " item(s) from " + storage.getFilePath());
       }
 
-      // ---- AUTO-SAVE every 5s if any active ----
+      // Auto-save
       autoSaveExecutor.scheduleAtFixedRate(this::autoSave, AUTO_SAVE_INTERVAL_SEC, AUTO_SAVE_INTERVAL_SEC,
             TimeUnit.SECONDS);
    }
 
-   // ================================================================
-   // REGISTRATION & ACTIONS
-   // ================================================================
    private void registerItem(DownloadItem item, boolean autoSubmit) {
       item.stateProperty().addListener((obs, oldV, newV) -> saveAsync());
       items.add(item);
@@ -273,9 +272,6 @@ public class PrimaryController {
       saveAsync();
    }
 
-   // ================================================================
-   // TASK ORCHESTRATION
-   // ================================================================
    private void submitTask(DownloadItem item, boolean isResume) {
       DownloadTask task = new DownloadTask(item, sharedClient, isResume);
       item.activeTask = task;
@@ -311,15 +307,15 @@ public class PrimaryController {
          deleteFile(item.getFile());
       } else if (item.getState() == DownloadItem.State.PAUSING) {
          item.setStateSafe(DownloadItem.State.PAUSED);
+         item.refreshSizeText();
       } else if (item.getState() == DownloadItem.State.DOWNLOADING) {
          item.setStateSafe(DownloadItem.State.COMPLETED);
          item.setProgressSafe(1.0);
+         // Pastikan teks ukuran di-update ke nilai final (byte tertulis terakhir)
+         item.refreshSizeText();
       }
    }
 
-   // ================================================================
-   // PERSISTENCE
-   // ================================================================
    private void saveAsync() {
       List<DownloadItem> snapshot = new ArrayList<>(items);
       saveExecutor.submit(() -> storage.save(snapshot));
@@ -336,7 +332,6 @@ public class PrimaryController {
    }
 
    public void shutdown() {
-      // Simpan synchronous agar tidak hilang saat process exit
       try {
          storage.save(new ArrayList<>(items));
       } catch (Exception ignored) {
@@ -350,9 +345,6 @@ public class PrimaryController {
       downloadPool.shutdownNow();
    }
 
-   // ================================================================
-   // HELPERS
-   // ================================================================
    private static String extractFilenameFromUrl(String url) {
       try {
          String path = URI.create(url).getPath();

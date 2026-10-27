@@ -58,7 +58,7 @@ public class DownloadTask extends Task<Void> {
          long size = probeResp.headers().firstValueAsLong("Content-Length").orElse(-1L);
          boolean rangeOk = "bytes".equalsIgnoreCase(
                probeResp.headers().firstValue("Accept-Ranges").orElse(""));
-         item.setTotalBytes(size);
+         item.setTotalBytes(size); // → memicu refreshSizeText
          item.setSupportsRange(rangeOk);
          if (size > 0 && rangeOk && size >= DownloadItem.MIN_CHUNK_SIZE * DownloadItem.NUM_CONNECTIONS) {
             item.setSegments(item.buildSegments());
@@ -74,7 +74,7 @@ public class DownloadTask extends Task<Void> {
    }
 
    // --------------------------------------------------------------
-   // MULTI
+   // MULTI-CONNECTION
    // --------------------------------------------------------------
    private Void downloadMulti() throws Exception {
       try (RandomAccessFile raf = new RandomAccessFile(item.getFile(), "rw")) {
@@ -163,6 +163,7 @@ public class DownloadTask extends Task<Void> {
          long total = item.getTotalBytes();
          if (total > 0)
             item.setProgressSafe((double) cur / total);
+         item.refreshSizeText(); // ← update "downloaded / total"
 
          double sec = (now - lastT) / 1_000_000_000.0;
          long delta = cur - lastB;
@@ -179,7 +180,7 @@ public class DownloadTask extends Task<Void> {
    }
 
    // --------------------------------------------------------------
-   // SINGLE
+   // SINGLE-CONNECTION
    // --------------------------------------------------------------
    private Void downloadSingle() throws Exception {
       long startOffset = item.bytesRef().get();
@@ -200,6 +201,8 @@ public class DownloadTask extends Task<Void> {
          resp.body().close();
          throw new RuntimeException("HTTP " + status);
       }
+
+      item.refreshSizeText(); // tampilkan "0 / X" sebelum byte pertama
 
       try (InputStream in = resp.body();
             RandomAccessFile raf = new RandomAccessFile(item.getFile(), "rw")) {
@@ -226,6 +229,7 @@ public class DownloadTask extends Task<Void> {
                long totalSize = item.getTotalBytes();
                if (totalSize > 0)
                   item.setProgressSafe((double) total / totalSize);
+               item.refreshSizeText(); // ← update "downloaded / total"
 
                double sec = (now - lastT) / 1_000_000_000.0;
                long delta = total - lastB;

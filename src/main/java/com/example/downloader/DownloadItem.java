@@ -25,6 +25,7 @@ public class DownloadItem {
    private final ObjectProperty<State> state = new SimpleObjectProperty<>(State.QUEUED);
    private final StringProperty statusText = new SimpleStringProperty("Menunggu");
    private final DoubleProperty progress = new SimpleDoubleProperty(0);
+   private final StringProperty sizeText = new SimpleStringProperty("-");
    private final StringProperty speed = new SimpleStringProperty("-");
    private final StringProperty eta = new SimpleStringProperty("-");
    private final StringProperty errorMessage = new SimpleStringProperty("");
@@ -56,7 +57,7 @@ public class DownloadItem {
       });
    }
 
-   // Properti publik untuk binding
+   // ---- Properti publik ----
    public StringProperty fileNameProperty() {
       return fileName;
    }
@@ -71,6 +72,10 @@ public class DownloadItem {
 
    public DoubleProperty progressProperty() {
       return progress;
+   }
+
+   public StringProperty sizeTextProperty() {
+      return sizeText;
    }
 
    public StringProperty speedProperty() {
@@ -97,7 +102,6 @@ public class DownloadItem {
       return state.get();
    }
 
-   // Button-state queries
    public boolean isPausable() {
       return state.get() == State.DOWNLOADING;
    }
@@ -110,7 +114,13 @@ public class DownloadItem {
       return state.get() == State.DOWNLOADING || state.get() == State.PAUSED;
    }
 
-   // Aksi user
+   public boolean isRemovable() {
+      State s = state.get();
+      return s == State.CANCELLED || s == State.COMPLETED
+            || s == State.FAILED || s == State.PAUSED;
+   }
+
+   // ---- Aksi user ----
    public void requestPause() {
       if (state.get() != State.DOWNLOADING)
          return;
@@ -132,21 +142,17 @@ public class DownloadItem {
          long sum = segments.stream().mapToLong(s -> s.currentOffset - s.start).sum();
          bytesDownloaded.set(sum);
       }
+      refreshSizeText();
    }
 
-   public boolean isRemovable() {
-      State s = state.get();
-      return s == State.CANCELLED || s == State.COMPLETED
-            || s == State.FAILED || s == State.PAUSED;
-   }
-
-   // Data backend (diakses oleh DownloadTask)
+   // ---- Backend data ----
    long getTotalBytes() {
       return totalBytes;
    }
 
    void setTotalBytes(long t) {
       this.totalBytes = t;
+      refreshSizeText();
    }
 
    void setSupportsRange(boolean s) {
@@ -181,7 +187,7 @@ public class DownloadItem {
       this.cancelRequested = c;
    }
 
-   // Update UI helpers (thread-safe)
+   // ---- UI update helpers ----
    void setStateSafe(State s) {
       Platform.runLater(() -> state.set(s));
    }
@@ -202,6 +208,14 @@ public class DownloadItem {
       Platform.runLater(() -> errorMessage.set(m));
    }
 
+   /** Bangun ulang teks ukuran dari bytesDownloaded & totalBytes saat ini. */
+   void refreshSizeText() {
+      long cur = bytesDownloaded.get();
+      long total = totalBytes;
+      String txt = formatBytes(cur) + " / " + (total > 0 ? formatBytes(total) : "?");
+      Platform.runLater(() -> sizeText.set(txt));
+   }
+
    List<Segment> buildSegments() {
       List<Segment> segs = new ArrayList<>();
       long chunkSize = totalBytes / NUM_CONNECTIONS;
@@ -217,6 +231,7 @@ public class DownloadItem {
       return supportsRange && totalBytes >= MIN_CHUNK_SIZE * NUM_CONNECTIONS;
    }
 
+   // ---- Formatters ----
    static String formatSpeed(double bps) {
       if (bps < 1024)
          return String.format("%.0f B/s", bps);
@@ -234,5 +249,17 @@ public class DownloadItem {
       if (seconds < 3600)
          return String.format("%dm %ds", seconds / 60, seconds % 60);
       return String.format("%dh %dm", seconds / 3600, (seconds % 3600) / 60);
+   }
+
+   static String formatBytes(long b) {
+      if (b < 0)
+         return "?";
+      if (b < 1024)
+         return b + " B";
+      if (b < 1024L * 1024)
+         return String.format("%.1f KB", b / 1024.0);
+      if (b < 1024L * 1024 * 1024)
+         return String.format("%.1f MB", b / 1024.0 / 1024.0);
+      return String.format("%.2f GB", b / 1024.0 / 1024.0 / 1024.0);
    }
 }

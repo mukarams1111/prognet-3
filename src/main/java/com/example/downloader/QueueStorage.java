@@ -129,7 +129,7 @@ public class QueueStorage {
       boolean fileMissing = !file.exists();
 
       DownloadItem item = new DownloadItem(pi.url, file);
-      item.setTotalBytes(pi.totalBytes);
+      item.setTotalBytes(pi.totalBytes); // memicu refreshSizeText (total set, cur=0)
       item.setSupportsRange(pi.supportsRange);
       item.fileNameProperty().set(pi.fileName);
 
@@ -148,13 +148,13 @@ public class QueueStorage {
          item.bytesRef().set(fileMissing ? 0 : pi.bytesDownloaded);
       }
 
-      // File hilang & tidak bisa resume (tanpa totalBytes) → drop
       if (fileMissing && pi.totalBytes <= 0)
          return null;
 
       if (pi.totalBytes > 0) {
          item.setProgressSafe((double) item.bytesRef().get() / pi.totalBytes);
       }
+      item.refreshSizeText(); // ← sinkronkan "downloaded / total"
 
       DownloadItem.State target = "FAILED".equals(pi.state)
             ? DownloadItem.State.FAILED

@@ -23,12 +23,13 @@
 
     <TableView fx:id="downloadTable" VBox.vgrow="ALWAYS">
         <columns>
-            <TableColumn fx:id="nameColumn" text="Nama File" prefWidth="240.0" />
-            <TableColumn fx:id="statusColumn" text="Status" prefWidth="120.0" />
-            <TableColumn fx:id="progressColumn" text="Progress" prefWidth="200.0" />
-            <TableColumn fx:id="speedColumn" text="Kecepatan" prefWidth="110.0" />
-            <TableColumn fx:id="etaColumn" text="ETA" prefWidth="90.0" />
-            <TableColumn fx:id="actionColumn" text="Aksi" prefWidth="240.0" />
+            <TableColumn fx:id="nameColumn"     text="Nama File" prefWidth="220.0" />
+            <TableColumn fx:id="statusColumn"   text="Status"    prefWidth="110.0" />
+            <TableColumn fx:id="progressColumn" text="Progress"  prefWidth="160.0" />
+            <TableColumn fx:id="sizeColumn"     text="Ukuran"    prefWidth="160.0" />
+            <TableColumn fx:id="speedColumn"    text="Kecepatan" prefWidth="100.0" />
+            <TableColumn fx:id="etaColumn"      text="ETA"       prefWidth="80.0" />
+            <TableColumn fx:id="actionColumn"   text="Aksi"      prefWidth="220.0" />
         </columns>
     </TableView>
 </VBox>
