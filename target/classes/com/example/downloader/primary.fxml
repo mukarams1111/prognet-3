@@ -17,7 +17,11 @@
 
     <TextField fx:id="urlField" promptText="Masukkan URL file (http/https)..." prefWidth="500.0" />
 
-    <Button fx:id="downloadButton" text="Download" onAction="#handleDownloadButtonAction" prefWidth="100.0" />
+    <HBox spacing="10.0" alignment="CENTER">
+        <Button fx:id="downloadButton" text="Download" onAction="#handleDownloadButtonAction" prefWidth="100.0" />
+        <Button fx:id="pauseResumeButton" text="Pause" onAction="#handlePauseResumeButtonAction" prefWidth="100.0" disable="true" />
+        <Button fx:id="cancelButton" text="Cancel" onAction="#handleCancelButtonAction" prefWidth="100.0" disable="true" />
+    </HBox>
 
     <ProgressBar fx:id="progressBar" prefWidth="500.0" />
 
