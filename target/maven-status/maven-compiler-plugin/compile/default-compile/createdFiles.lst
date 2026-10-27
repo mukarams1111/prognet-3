@@ -1,3 +1,13 @@
+com\example\downloader\Main.class
+com\example\downloader\QueueStorage$PersistedQueue.class
+com\example\downloader\Segment.class
+com\example\downloader\DownloadTask.class
+com\example\downloader\QueueStorage.class
 com\example\downloader\PrimaryController$2.class
+com\example\downloader\QueueStorage$PersistedItem.class
 module-info.class
+com\example\downloader\PrimaryController.class
+com\example\downloader\QueueStorage$PersistedSegment.class
+com\example\downloader\DownloadItem.class
 com\example\downloader\PrimaryController$1.class
+com\example\downloader\DownloadItem$State.class
