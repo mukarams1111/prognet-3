@@ -19,9 +19,22 @@ import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class PrimaryController {
+
+   private static final int NUM_CONNECTIONS = 4;
+   private static final long MIN_CHUNK_SIZE = 1024 * 1024; // 1 MB per segmen minimum
+   private static final String UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
    @FXML
    private TextField urlField;
@@ -49,12 +62,14 @@ public class PrimaryController {
 
    private State state = State.IDLE;
 
-   // Konteks download yang sedang aktif
    private String currentUrl;
    private File currentFile;
    private long totalBytes = -1;
-   private long bytesDownloaded = 0;
+   private final AtomicLong bytesDownloaded = new AtomicLong(0);
    private boolean supportsRange = false;
+
+   // Jika tidak null → pakai multi-connection. Jika null → single-connection.
+   private List<Segment> currentSegments;
 
    private DownloadTask activeTask;
    private volatile boolean pauseRequested = false;
@@ -67,7 +82,6 @@ public class PrimaryController {
    private void handleDownloadButtonAction() {
       if (state != State.IDLE)
          return;
-
       String urlString = urlField.getText().trim();
       if (urlString.isEmpty()) {
          statusLabel.setText("Error: URL tidak boleh kosong!");
@@ -95,15 +109,15 @@ public class PrimaryController {
          statusLabel.textProperty().unbind();
          statusLabel.setText("Status: Menghentikan sementara...");
       } else if (state == State.PAUSED) {
-         startDownload(true); // resume
+         startDownload(true);
       }
    }
 
    @FXML
    private void handleCancelButtonAction() {
       if (state == State.PAUSED) {
-         // Tidak ada task aktif — langsung bersihkan
          deletePartialFile();
+         currentSegments = null;
          resetToIdle();
          statusLabel.setText("Status: Download dibatalkan.");
       } else if (state == State.DOWNLOADING) {
@@ -117,7 +131,7 @@ public class PrimaryController {
    }
 
    // ================================================================
-   // PROBE (metadata saja — body langsung ditutup)
+   // PROBE
    // ================================================================
    private void startProbe() {
       state = State.PROBING;
@@ -130,19 +144,14 @@ public class PrimaryController {
          @Override
          protected ProbeResult call() throws Exception {
             updateMessage("Status: Menghubungi server...");
-
             HttpClient client = HttpClient.newBuilder()
                   .followRedirects(HttpClient.Redirect.ALWAYS)
                   .build();
-
             HttpRequest request = HttpRequest.newBuilder()
                   .uri(URI.create(currentUrl))
-                  .header("User-Agent",
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                  .header("User-Agent", UA)
                   .header("Accept", "*/*")
-                  .GET()
-                  .build();
-
+                  .GET().build();
             HttpResponse<InputStream> response = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
 
             if (response.statusCode() != 200) {
@@ -152,7 +161,6 @@ public class PrimaryController {
                }
                throw new RuntimeException("Server merespons HTTP " + response.statusCode());
             }
-
             String contentType = response.headers().firstValue("Content-Type").orElse("").toLowerCase();
             if (contentType.startsWith("text/html")) {
                try {
@@ -161,8 +169,6 @@ public class PrimaryController {
                }
                throw new RuntimeException("URL mengembalikan halaman HTML, bukan file.");
             }
-
-            // Body tidak diperlukan — tutup segera
             try {
                response.body().close();
             } catch (Exception ignored) {
@@ -172,7 +178,6 @@ public class PrimaryController {
             boolean rangeOk = "bytes".equalsIgnoreCase(
                   response.headers().firstValue("Accept-Ranges").orElse(""));
             String filename = detectFilename(currentUrl, response);
-
             return new ProbeResult(size, rangeOk, filename);
          }
       };
@@ -185,10 +190,6 @@ public class PrimaryController {
          totalBytes = r.size;
          supportsRange = r.supportsRange;
 
-         if (!supportsRange) {
-            System.out.println("WARNING: Server tidak mendukung Range. Resume tidak akan bekerja.");
-         }
-
          File destination = showSaveDialog(r.filename);
          if (destination == null) {
             statusLabel.setText("Status: Download dibatalkan.");
@@ -197,7 +198,17 @@ public class PrimaryController {
             return;
          }
          currentFile = destination;
-         bytesDownloaded = 0;
+         bytesDownloaded.set(0);
+         currentSegments = canUseMultiConnection() ? buildSegments() : null;
+
+         if (currentSegments != null) {
+            System.out.printf("Multi-connection mode: %d segments of ~%d bytes%n",
+                  NUM_CONNECTIONS, totalBytes / NUM_CONNECTIONS);
+         } else {
+            System.out.println("Single-connection mode (" +
+                  (!supportsRange ? "no Range support" : "file too small") + ")");
+         }
+
          startDownload(false);
       });
 
@@ -217,16 +228,24 @@ public class PrimaryController {
    }
 
    // ================================================================
-   // DOWNLOAD (fresh atau resume)
+   // DOWNLOAD DISPATCHER
    // ================================================================
    private void startDownload(boolean isResume) {
       state = State.DOWNLOADING;
       pauseRequested = false;
       cancelRequested = false;
+
+      // Re-sum progress dari segmen (lebih akurat dari bytesDownloaded yang mungkin drift)
+      if (isResume && currentSegments != null) {
+         long sum = currentSegments.stream()
+               .mapToLong(s -> s.currentOffset - s.start)
+               .sum();
+         bytesDownloaded.set(sum);
+      }
+
       updateButtonState();
 
-      long startOffset = isResume ? bytesDownloaded : 0;
-      activeTask = new DownloadTask(startOffset);
+      activeTask = new DownloadTask(isResume);
 
       progressBar.progressProperty().bind(activeTask.progressProperty());
       statusLabel.textProperty().bind(activeTask.messageProperty());
@@ -237,6 +256,7 @@ public class PrimaryController {
          unbindAfterTask();
          if (cancelRequested) {
             deletePartialFile();
+            currentSegments = null;
             resetToIdle();
             statusLabel.setText("Status: Download dibatalkan.");
          } else if (pauseRequested) {
@@ -244,15 +264,16 @@ public class PrimaryController {
             updateButtonState();
             if (totalBytes > 0) {
                statusLabel.setText(String.format("Status: Dijeda di %.1f%% (%s / %s)",
-                     bytesDownloaded * 100.0 / totalBytes,
-                     formatBytes(bytesDownloaded), formatBytes(totalBytes)));
+                     bytesDownloaded.get() * 100.0 / totalBytes,
+                     formatBytes(bytesDownloaded.get()), formatBytes(totalBytes)));
             } else {
-               statusLabel.setText("Status: Dijeda di " + formatBytes(bytesDownloaded));
+               statusLabel.setText("Status: Dijeda di " + formatBytes(bytesDownloaded.get()));
             }
             speedLabel.setText("Kecepatan: -");
             etaLabel.setText("ETA: -");
          } else {
             state = State.IDLE;
+            currentSegments = null;
             progressBar.setProgress(1.0);
             statusLabel.setText("Status: Selesai! Disimpan sebagai " + currentFile.getName());
             speedLabel.setText("Kecepatan: -");
@@ -268,6 +289,7 @@ public class PrimaryController {
          statusLabel.setText("Status: Gagal! " + (ex != null ? ex.getMessage() : "unknown"));
          speedLabel.setText("Kecepatan: -");
          etaLabel.setText("ETA: -");
+         currentSegments = null;
          state = State.IDLE;
          updateButtonState();
          if (ex != null)
@@ -281,16 +303,14 @@ public class PrimaryController {
    }
 
    // ================================================================
-   // DOWNLOAD TASK — mendukung Range resume
+   // TASK — dispatch ke single atau multi
    // ================================================================
    private class DownloadTask extends Task<Void> {
 
-      private final long startOffset;
       private final ReadOnlyStringWrapper speedText = new ReadOnlyStringWrapper("-");
       private final ReadOnlyStringWrapper etaText = new ReadOnlyStringWrapper("-");
 
-      DownloadTask(long startOffset) {
-         this.startOffset = startOffset;
+      DownloadTask(boolean isResume) {
       }
 
       public ReadOnlyStringProperty speedTextProperty() {
@@ -303,17 +323,165 @@ public class PrimaryController {
 
       @Override
       protected Void call() throws Exception {
-         updateMessage(startOffset > 0 ? "Status: Melanjutkan unduhan..." : "Status: Mengunduh...");
+         if (currentSegments != null) {
+            return downloadMulti();
+         } else {
+            return downloadSingle();
+         }
+      }
+
+      // ------------------------------------------------------------
+      // MULTI-CONNECTION
+      // ------------------------------------------------------------
+      private Void downloadMulti() throws Exception {
+         updateMessage("Status: Mengunduh (" + NUM_CONNECTIONS + " koneksi paralel)...");
+
+         HttpClient client = HttpClient.newBuilder()
+               .followRedirects(HttpClient.Redirect.ALWAYS)
+               .version(HttpClient.Version.HTTP_1_1) // paksa 1.1 → parallel TCP
+               .build();
+
+         try (RandomAccessFile raf = new RandomAccessFile(currentFile, "rw")) {
+            if (bytesDownloaded.get() == 0) {
+               raf.setLength(totalBytes); // pre-allocate untuk fresh start
+            }
+            FileChannel channel = raf.getChannel();
+
+            ExecutorService executor = Executors.newFixedThreadPool(NUM_CONNECTIONS);
+            List<Future<Void>> futures = new ArrayList<>();
+            for (Segment seg : currentSegments) {
+               futures.add(executor.submit(() -> downloadSegment(client, channel, seg)));
+            }
+
+            Thread monitor = new Thread(this::monitorProgress, "progress-monitor");
+            monitor.setDaemon(true);
+            monitor.start();
+
+            try {
+               for (Future<Void> f : futures)
+                  f.get();
+            } catch (Exception e) {
+               cancelRequested = true;
+               throw e;
+            } finally {
+               executor.shutdownNow();
+               monitor.interrupt();
+            }
+         }
+         return null;
+      }
+
+      private Void downloadSegment(HttpClient client, FileChannel channel, Segment seg) throws Exception {
+         int retries = 0;
+         while (!seg.isComplete()) {
+            if (pauseRequested || cancelRequested)
+               return null;
+            if (retries > 3) {
+               throw new RuntimeException("Segment " + seg.id + " gagal setelah 3 retry");
+            }
+
+            try {
+               HttpRequest req = HttpRequest.newBuilder()
+                     .uri(URI.create(currentUrl))
+                     .header("User-Agent", UA)
+                     .header("Accept", "*/*")
+                     .header("Range", "bytes=" + seg.currentOffset + "-" + seg.end)
+                     .GET().build();
+
+               HttpResponse<InputStream> resp = client.send(req, HttpResponse.BodyHandlers.ofInputStream());
+               int code = resp.statusCode();
+
+               if (code == 200) {
+                  try {
+                     resp.body().close();
+                  } catch (Exception ignored) {
+                  }
+                  throw new RuntimeException("Server mengabaikan Range (200), multi-connection tidak bisa dilanjutkan");
+               }
+               if (code != 206) {
+                  try {
+                     resp.body().close();
+                  } catch (Exception ignored) {
+                  }
+                  throw new RuntimeException("Segment " + seg.id + " HTTP " + code);
+               }
+
+               try (InputStream in = resp.body()) {
+                  byte[] buffer = new byte[65536];
+                  int n;
+                  while ((n = in.read(buffer)) != -1) {
+                     if (pauseRequested || cancelRequested)
+                        return null;
+                     channel.write(ByteBuffer.wrap(buffer, 0, n), seg.currentOffset);
+                     seg.currentOffset += n;
+                     bytesDownloaded.addAndGet(n);
+                  }
+               }
+               retries = 0; // reset on success
+            } catch (Exception e) {
+               if (pauseRequested || cancelRequested)
+                  return null;
+               retries++;
+               System.err.println("Segment " + seg.id + " error (retry " + retries + "): " + e.getMessage());
+               Thread.sleep(1000L * retries);
+            }
+         }
+         return null;
+      }
+
+      private void monitorProgress() {
+         long lastTime = System.nanoTime();
+         long lastBytes = bytesDownloaded.get();
+         while (!pauseRequested && !cancelRequested) {
+            try {
+               Thread.sleep(200);
+            } catch (InterruptedException e) {
+               return;
+            }
+
+            long now = System.nanoTime();
+            long current = bytesDownloaded.get();
+            boolean allDone = currentSegments.stream().allMatch(Segment::isComplete);
+
+            if (totalBytes > 0) {
+               updateProgress(current, totalBytes);
+            }
+
+            double elapsed = (now - lastTime) / 1_000_000_000.0;
+            long delta = current - lastBytes;
+            double speedBps = elapsed > 0 ? delta / elapsed : 0;
+            String s = formatSpeed(speedBps);
+            String eta = totalBytes > 0 ? formatEta(totalBytes - current, speedBps) : "tidak diketahui";
+
+            Platform.runLater(() -> {
+               speedText.set(s);
+               etaText.set(eta);
+            });
+
+            lastTime = now;
+            lastBytes = current;
+
+            if (allDone)
+               break;
+         }
+      }
+
+      // ------------------------------------------------------------
+      // SINGLE-CONNECTION (fallback, sama seperti Iterasi 3)
+      // ------------------------------------------------------------
+      private Void downloadSingle() throws Exception {
+         updateMessage(bytesDownloaded.get() > 0
+               ? "Status: Melanjutkan unduhan (1 koneksi)..."
+               : "Status: Mengunduh (1 koneksi)...");
 
          HttpClient client = HttpClient.newBuilder()
                .followRedirects(HttpClient.Redirect.ALWAYS)
                .build();
 
-         long actualStart = startOffset;
+         long actualStart = bytesDownloaded.get();
          HttpResponse<InputStream> response = fetchResponse(client, actualStart);
          int status = response.statusCode();
 
-         // Handle resume: expect 206. If 200, server ignored Range → restart dari 0
          if (actualStart > 0) {
             if (status == 200) {
                try {
@@ -322,7 +490,7 @@ public class PrimaryController {
                }
                updateMessage("Status: Server tidak mendukung resume, restart dari awal...");
                actualStart = 0;
-               bytesDownloaded = 0;
+               bytesDownloaded.set(0);
                response = fetchResponse(client, 0);
                status = response.statusCode();
                if (status != 200) {
@@ -338,13 +506,12 @@ public class PrimaryController {
             throw new RuntimeException("Server merespons HTTP " + status);
          }
 
-         // Jika totalBytes belum diketahui, coba parse dari Content-Range (206)
          if (totalBytes <= 0) {
-            String contentRange = response.headers().firstValue("Content-Range").orElse("");
-            int slash = contentRange.indexOf('/');
+            String cr = response.headers().firstValue("Content-Range").orElse("");
+            int slash = cr.indexOf('/');
             if (slash > 0) {
                try {
-                  totalBytes = Long.parseLong(contentRange.substring(slash + 1));
+                  totalBytes = Long.parseLong(cr.substring(slash + 1));
                } catch (NumberFormatException ignored) {
                }
             }
@@ -353,9 +520,8 @@ public class PrimaryController {
          try (InputStream in = response.body();
                RandomAccessFile raf = new RandomAccessFile(currentFile, "rw")) {
 
-            if (actualStart == 0) {
-               raf.setLength(0); // truncate (fresh start atau restart)
-            }
+            if (actualStart == 0)
+               raf.setLength(0);
             raf.seek(actualStart);
 
             byte[] buffer = new byte[65536];
@@ -368,25 +534,22 @@ public class PrimaryController {
             while ((n = in.read(buffer)) != -1) {
                if (pauseRequested || cancelRequested)
                   break;
-
                raf.write(buffer, 0, n);
                total += n;
-               bytesDownloaded = total;
+               bytesDownloaded.set(total);
 
                long now = System.nanoTime();
                if (now - lastUiUpdate >= 200_000_000L) {
-                  if (totalBytes > 0) {
+                  if (totalBytes > 0)
                      updateProgress(total, totalBytes);
-                  } else {
-                     updateProgress(-1, 1); // indeterminate
-                  }
+                  else
+                     updateProgress(-1, 1);
+
                   double elapsed = (now - lastSampleTime) / 1_000_000_000.0;
                   long delta = total - lastSampleBytes;
                   double speedBps = elapsed > 0 ? delta / elapsed : 0;
                   String s = formatSpeed(speedBps);
-                  String eta = (totalBytes > 0)
-                        ? formatEta(totalBytes - total, speedBps)
-                        : "tidak diketahui";
+                  String eta = totalBytes > 0 ? formatEta(totalBytes - total, speedBps) : "tidak diketahui";
                   Platform.runLater(() -> {
                      speedText.set(s);
                      etaText.set(eta);
@@ -396,10 +559,8 @@ public class PrimaryController {
                   lastUiUpdate = now;
                }
             }
-
-            if (pauseRequested && !cancelRequested) {
+            if (pauseRequested && !cancelRequested)
                updateMessage("Status: Dijeda");
-            }
          }
          return null;
       }
@@ -407,19 +568,53 @@ public class PrimaryController {
       private HttpResponse<InputStream> fetchResponse(HttpClient client, long offset) throws Exception {
          HttpRequest.Builder b = HttpRequest.newBuilder()
                .uri(URI.create(currentUrl))
-               .header("User-Agent",
-                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+               .header("User-Agent", UA)
                .header("Accept", "*/*");
-         if (offset > 0) {
+         if (offset > 0)
             b.header("Range", "bytes=" + offset + "-");
-         }
          return client.send(b.GET().build(), HttpResponse.BodyHandlers.ofInputStream());
+      }
+   }
+
+   // ================================================================
+   // SEGMENT
+   // ================================================================
+   private static class Segment {
+      final int id;
+      final long start;
+      final long end;
+      volatile long currentOffset;
+
+      Segment(int id, long start, long end) {
+         this.id = id;
+         this.start = start;
+         this.end = end;
+         this.currentOffset = start;
+      }
+
+      boolean isComplete() {
+         return currentOffset > end;
       }
    }
 
    // ================================================================
    // HELPERS
    // ================================================================
+   private boolean canUseMultiConnection() {
+      return supportsRange && totalBytes > 0 && totalBytes >= MIN_CHUNK_SIZE * NUM_CONNECTIONS;
+   }
+
+   private List<Segment> buildSegments() {
+      List<Segment> segs = new ArrayList<>();
+      long chunkSize = totalBytes / NUM_CONNECTIONS;
+      for (int i = 0; i < NUM_CONNECTIONS; i++) {
+         long start = i * chunkSize;
+         long end = (i == NUM_CONNECTIONS - 1) ? totalBytes - 1 : (start + chunkSize - 1);
+         segs.add(new Segment(i, start, end));
+      }
+      return segs;
+   }
+
    private void updateButtonState() {
       switch (state) {
          case IDLE -> {
@@ -457,7 +652,7 @@ public class PrimaryController {
       currentUrl = null;
       currentFile = null;
       totalBytes = -1;
-      bytesDownloaded = 0;
+      bytesDownloaded.set(0);
       pauseRequested = false;
       cancelRequested = false;
       progressBar.setProgress(0);
@@ -474,10 +669,8 @@ public class PrimaryController {
    }
 
    private void deletePartialFile() {
-      if (currentFile != null && currentFile.exists()) {
-         if (!currentFile.delete()) {
-            System.err.println("Gagal hapus file partial: " + currentFile.getAbsolutePath());
-         }
+      if (currentFile != null && currentFile.exists() && !currentFile.delete()) {
+         System.err.println("Gagal hapus file partial: " + currentFile.getAbsolutePath());
       }
    }
 
@@ -514,7 +707,7 @@ public class PrimaryController {
    }
 
    // ================================================================
-   // Deteksi nama file (tidak berubah dari Iterasi 1.5)
+   // Deteksi nama file (tidak berubah)
    // ================================================================
    private String detectFilename(String urlString, HttpResponse<?> response) {
       Optional<String> disposition = response.headers().firstValue("Content-Disposition");
@@ -569,72 +762,44 @@ public class PrimaryController {
    }
 
    private String extensionFromMimeType(String contentType) {
-      String mime = contentType.split(";")[0].trim();
-      switch (mime) {
-         case "application/pdf":
-            return ".pdf";
-         case "application/zip":
-            return ".zip";
-         case "application/x-7z-compressed":
-            return ".7z";
-         case "application/x-rar-compressed":
-         case "application/vnd.rar":
-            return ".rar";
-         case "application/x-tar":
-            return ".tar";
-         case "application/gzip":
-            return ".gz";
-         case "application/json":
-            return ".json";
-         case "application/xml":
-            return ".xml";
-         case "application/msword":
-            return ".doc";
-         case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            return ".docx";
-         case "application/vnd.ms-excel":
-            return ".xls";
-         case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-            return ".xlsx";
-         case "application/vnd.ms-powerpoint":
-            return ".ppt";
-         case "application/vnd.openxmlformats-officedocument.presentationml.presentation":
-            return ".pptx";
-         case "text/plain":
-            return ".txt";
-         case "text/csv":
-            return ".csv";
-         case "image/jpeg":
-            return ".jpg";
-         case "image/png":
-            return ".png";
-         case "image/gif":
-            return ".gif";
-         case "image/webp":
-            return ".webp";
-         case "image/svg+xml":
-            return ".svg";
-         case "audio/mpeg":
-            return ".mp3";
-         case "audio/ogg":
-            return ".ogg";
-         case "audio/wav":
-            return ".wav";
-         case "video/mp4":
-            return ".mp4";
-         case "video/webm":
-            return ".webm";
-         case "video/x-matroska":
-            return ".mkv";
-         default:
-            if (mime.contains("/")) {
-               String subtype = mime.substring(mime.indexOf('/') + 1);
-               if (subtype.matches("[a-z0-9]{1,5}"))
-                  return "." + subtype;
+        String mime = contentType.split(";")[0].trim();
+        return switch (mime) {
+            case "application/pdf" -> ".pdf";
+            case "application/zip" -> ".zip";
+            case "application/x-7z-compressed" -> ".7z";
+            case "application/x-rar-compressed", "application/vnd.rar" -> ".rar";
+            case "application/x-tar" -> ".tar";
+            case "application/gzip" -> ".gz";
+            case "application/json" -> ".json";
+            case "application/xml" -> ".xml";
+            case "application/msword" -> ".doc";
+            case "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> ".docx";
+            case "application/vnd.ms-excel" -> ".xls";
+            case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" -> ".xlsx";
+            case "application/vnd.ms-powerpoint" -> ".ppt";
+            case "application/vnd.openxmlformats-officedocument.presentationml.presentation" -> ".pptx";
+            case "text/plain" -> ".txt";
+            case "text/csv" -> ".csv";
+            case "image/jpeg" -> ".jpg";
+            case "image/png" -> ".png";
+            case "image/gif" -> ".gif";
+            case "image/webp" -> ".webp";
+            case "image/svg+xml" -> ".svg";
+            case "audio/mpeg" -> ".mp3";
+            case "audio/ogg" -> ".ogg";
+            case "audio/wav" -> ".wav";
+            case "video/mp4" -> ".mp4";
+            case "video/webm" -> ".webm";
+            case "video/x-matroska" -> ".mkv";
+            default -> {
+                if (mime.contains("/")) {
+                    String subtype = mime.substring(mime.indexOf('/') + 1);
+                    if (subtype.matches("[a-z0-9]{1,5}")) yield "." + subtype;
+                }
+                yield null;
             }
-            return null;
-      }
-   }
+        };
+    }
 
    private String extractBaseNameFromUrl(String urlString) {
       try {
