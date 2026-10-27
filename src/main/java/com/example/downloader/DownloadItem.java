@@ -136,7 +136,8 @@ public class DownloadItem {
 
    public boolean isRemovable() {
       State s = state.get();
-      return s == State.CANCELLED || s == State.COMPLETED || s == State.FAILED;
+      return s == State.CANCELLED || s == State.COMPLETED
+            || s == State.FAILED || s == State.PAUSED;
    }
 
    // Data backend (diakses oleh DownloadTask)

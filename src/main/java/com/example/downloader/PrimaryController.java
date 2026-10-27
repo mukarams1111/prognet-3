@@ -1,5 +1,6 @@
 package com.example.downloader;
 
+import javafx.application.Platform;
 import javafx.beans.binding.Bindings;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.collections.FXCollections;
@@ -13,12 +14,17 @@ import javafx.stage.FileChooser;
 import java.io.File;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class PrimaryController {
 
    private static final int MAX_CONCURRENT_DOWNLOADS = 3;
+   private static final long AUTO_SAVE_INTERVAL_SEC = 5;
 
    @FXML
    private TextField urlField;
@@ -40,13 +46,30 @@ public class PrimaryController {
    private TableColumn<DownloadItem, DownloadItem> actionColumn;
 
    private final ObservableList<DownloadItem> items = FXCollections.observableArrayList();
+   private final QueueStorage storage = new QueueStorage();
+
    private final ExecutorService downloadPool = Executors.newFixedThreadPool(
          MAX_CONCURRENT_DOWNLOADS,
          r -> {
             Thread t = new Thread(r, "download-worker");
-            t.setDaemon(true); // ← restore: daemon = JVM bisa exit kapan saja
+            t.setDaemon(true);
             return t;
          });
+
+   private final ExecutorService saveExecutor = Executors.newSingleThreadExecutor(
+         r -> {
+            Thread t = new Thread(r, "save-worker");
+            t.setDaemon(true);
+            return t;
+         });
+
+   private final ScheduledExecutorService autoSaveExecutor = Executors.newSingleThreadScheduledExecutor(
+         r -> {
+            Thread t = new Thread(r, "auto-save");
+            t.setDaemon(true);
+            return t;
+         });
+
    private final HttpClient sharedClient = HttpClient.newBuilder()
          .followRedirects(HttpClient.Redirect.ALWAYS)
          .version(HttpClient.Version.HTTP_1_1)
@@ -61,7 +84,6 @@ public class PrimaryController {
       speedColumn.setCellValueFactory(cd -> cd.getValue().speedProperty());
       etaColumn.setCellValueFactory(cd -> cd.getValue().etaProperty());
 
-      // Progress column
       progressColumn.setCellValueFactory(cd -> new SimpleObjectProperty<>(cd.getValue()));
       progressColumn.setCellFactory(col -> new TableCell<>() {
          private final ProgressBar pb = new ProgressBar(0);
@@ -74,49 +96,46 @@ public class PrimaryController {
          protected void updateItem(DownloadItem it, boolean empty) {
             super.updateItem(it, empty);
             pb.progressProperty().unbind();
-            if (empty || it == null) {
+            if (empty || it == null)
                setGraphic(null);
-            } else {
+            else {
                pb.progressProperty().bind(it.progressProperty());
                setGraphic(pb);
             }
          }
       });
 
-      // Action column: Pause / Resume / Cancel / Remove (visibility by state)
       actionColumn.setCellValueFactory(cd -> new SimpleObjectProperty<>(cd.getValue()));
       actionColumn.setCellFactory(col -> new TableCell<>() {
-
          private final Button pauseBtn = new Button("Pause");
          private final Button resumeBtn = new Button("Resume");
          private final Button cancelBtn = new Button("Cancel");
          private final Button removeBtn = new Button("Remove");
          private final HBox box = new HBox(4, pauseBtn, resumeBtn, cancelBtn, removeBtn);
-
          {
             pauseBtn.setOnAction(e -> {
-               DownloadItem it = currentItem();
+               DownloadItem it = current();
                if (it != null)
                   it.requestPause();
             });
             resumeBtn.setOnAction(e -> {
-               DownloadItem it = currentItem();
+               DownloadItem it = current();
                if (it != null)
                   resumeItem(it);
             });
             cancelBtn.setOnAction(e -> {
-               DownloadItem it = currentItem();
+               DownloadItem it = current();
                if (it != null)
                   cancelItem(it);
             });
             removeBtn.setOnAction(e -> {
-               DownloadItem it = currentItem();
+               DownloadItem it = current();
                if (it != null)
                   removeItem(it);
             });
          }
 
-         private DownloadItem currentItem() {
+         private DownloadItem current() {
             int idx = getIndex();
             if (idx < 0 || idx >= getTableView().getItems().size())
                return null;
@@ -126,67 +145,47 @@ public class PrimaryController {
          @Override
          protected void updateItem(DownloadItem it, boolean empty) {
             super.updateItem(it, empty);
-
-            // Unbind dulu semua (penting untuk cell recycling)
-            pauseBtn.visibleProperty().unbind();
-            pauseBtn.managedProperty().unbind();
-            resumeBtn.visibleProperty().unbind();
-            resumeBtn.managedProperty().unbind();
-            cancelBtn.visibleProperty().unbind();
-            cancelBtn.managedProperty().unbind();
-            removeBtn.visibleProperty().unbind();
-            removeBtn.managedProperty().unbind();
-
+            for (Button b : new Button[] { pauseBtn, resumeBtn, cancelBtn, removeBtn }) {
+               b.visibleProperty().unbind();
+               b.managedProperty().unbind();
+            }
             if (empty || it == null) {
                setGraphic(null);
                return;
             }
-
-            var state = it.stateProperty();
-
-            pauseBtn.visibleProperty().bind(
-                  state.isEqualTo(DownloadItem.State.DOWNLOADING));
+            var st = it.stateProperty();
+            pauseBtn.visibleProperty().bind(st.isEqualTo(DownloadItem.State.DOWNLOADING));
             pauseBtn.managedProperty().bind(pauseBtn.visibleProperty());
-
             resumeBtn.visibleProperty().bind(
-                  state.isEqualTo(DownloadItem.State.PAUSED)
-                        .or(state.isEqualTo(DownloadItem.State.FAILED)));
+                  st.isEqualTo(DownloadItem.State.PAUSED).or(st.isEqualTo(DownloadItem.State.FAILED)));
             resumeBtn.managedProperty().bind(resumeBtn.visibleProperty());
-
             cancelBtn.visibleProperty().bind(
-                  state.isEqualTo(DownloadItem.State.DOWNLOADING)
-                        .or(state.isEqualTo(DownloadItem.State.PAUSED)));
+                  st.isEqualTo(DownloadItem.State.DOWNLOADING).or(st.isEqualTo(DownloadItem.State.PAUSED)));
             cancelBtn.managedProperty().bind(cancelBtn.visibleProperty());
-
             removeBtn.visibleProperty().bind(
-                  state.isEqualTo(DownloadItem.State.CANCELLED)
-                        .or(state.isEqualTo(DownloadItem.State.COMPLETED))
-                        .or(state.isEqualTo(DownloadItem.State.FAILED)));
+                  st.isEqualTo(DownloadItem.State.CANCELLED)
+                        .or(st.isEqualTo(DownloadItem.State.COMPLETED))
+                        .or(st.isEqualTo(DownloadItem.State.FAILED))
+                        .or(st.isEqualTo(DownloadItem.State.PAUSED)));
             removeBtn.managedProperty().bind(removeBtn.visibleProperty());
-
             setGraphic(box);
          }
       });
 
-      // Context menu (klik kanan) — hanya di baris yang terisi
       downloadTable.setRowFactory(tv -> {
          TableRow<DownloadItem> row = new TableRow<>();
          ContextMenu cm = new ContextMenu();
          MenuItem removeMi = new MenuItem("Hapus dari daftar");
          removeMi.setOnAction(e -> {
-            DownloadItem item = row.getItem();
-            if (item != null)
-               removeItem(item);
+            if (row.getItem() != null)
+               removeItem(row.getItem());
          });
          cm.getItems().add(removeMi);
          row.contextMenuProperty().bind(
-               Bindings.when(row.emptyProperty())
-                     .then((ContextMenu) null)
-                     .otherwise(cm));
+               Bindings.when(row.emptyProperty()).then((ContextMenu) null).otherwise(cm));
          return row;
       });
 
-      // Shortcut: tekan Delete pada baris terpilih
       downloadTable.setOnKeyPressed(e -> {
          if (e.getCode() == KeyCode.DELETE) {
             DownloadItem sel = downloadTable.getSelectionModel().getSelectedItem();
@@ -194,11 +193,31 @@ public class PrimaryController {
                removeItem(sel);
          }
       });
+
+      // ---- RESTORE ----
+      List<DownloadItem> restored = storage.load();
+      for (DownloadItem it : restored) {
+         registerItem(it, false);
+      }
+      if (!restored.isEmpty()) {
+         System.out.println("Restored " + restored.size() + " item(s) from " + storage.getFilePath());
+      }
+
+      // ---- AUTO-SAVE every 5s if any active ----
+      autoSaveExecutor.scheduleAtFixedRate(this::autoSave, AUTO_SAVE_INTERVAL_SEC, AUTO_SAVE_INTERVAL_SEC,
+            TimeUnit.SECONDS);
    }
 
    // ================================================================
-   // ACTIONS
+   // REGISTRATION & ACTIONS
    // ================================================================
+   private void registerItem(DownloadItem item, boolean autoSubmit) {
+      item.stateProperty().addListener((obs, oldV, newV) -> saveAsync());
+      items.add(item);
+      if (autoSubmit)
+         submitTask(item, false);
+   }
+
    @FXML
    private void handleAddDownload() {
       String url = urlField.getText().trim();
@@ -225,9 +244,8 @@ public class PrimaryController {
          return;
 
       DownloadItem item = new DownloadItem(url, dest);
-      items.add(item);
+      registerItem(item, true);
       urlField.clear();
-      submitTask(item, false);
    }
 
    private void resumeItem(DownloadItem item) {
@@ -243,19 +261,16 @@ public class PrimaryController {
       }
    }
 
-   /**
-    * Remove dari daftar — hanya untuk state terminal.
-    * File fisik TIDAK dihapus (untuk COMPLETED, file adalah hasil yang diinginkan user).
-    */
    private void removeItem(DownloadItem item) {
       if (!item.isRemovable()) {
          showAlert("Tidak bisa dihapus",
-               "Hanya unduhan yang Selesai, Gagal, atau Dibatalkan yang bisa dihapus dari daftar.");
+               "Hanya item yang Selesai, Gagal, Dibatalkan, atau Dijeda yang bisa dihapus.");
          return;
       }
       if (item.activeTask != null)
-         return; // safety (tidak mungkin untuk state terminal)
+         return;
       items.remove(item);
+      saveAsync();
    }
 
    // ================================================================
@@ -303,6 +318,39 @@ public class PrimaryController {
    }
 
    // ================================================================
+   // PERSISTENCE
+   // ================================================================
+   private void saveAsync() {
+      List<DownloadItem> snapshot = new ArrayList<>(items);
+      saveExecutor.submit(() -> storage.save(snapshot));
+   }
+
+   private void autoSave() {
+      Platform.runLater(() -> {
+         List<DownloadItem> snapshot = new ArrayList<>(items);
+         boolean hasActive = snapshot.stream()
+               .anyMatch(it -> it.getState() == DownloadItem.State.DOWNLOADING);
+         if (hasActive)
+            saveExecutor.submit(() -> storage.save(snapshot));
+      });
+   }
+
+   public void shutdown() {
+      // Simpan synchronous agar tidak hilang saat process exit
+      try {
+         storage.save(new ArrayList<>(items));
+      } catch (Exception ignored) {
+      }
+      for (DownloadItem item : items) {
+         if (item.activeTask != null)
+            item.requestCancel();
+      }
+      autoSaveExecutor.shutdownNow();
+      saveExecutor.shutdownNow();
+      downloadPool.shutdownNow();
+   }
+
+   // ================================================================
    // HELPERS
    // ================================================================
    private static String extractFilenameFromUrl(String url) {
@@ -318,24 +366,14 @@ public class PrimaryController {
    }
 
    private void deleteFile(File f) {
-      if (f != null && f.exists() && !f.delete()) {
-         System.err.println("Gagal hapus file: " + f.getAbsolutePath());
-      }
+      if (f != null && f.exists() && !f.delete())
+         System.err.println("Gagal hapus: " + f.getAbsolutePath());
    }
 
-   private void showAlert(String title, String message) {
-      Alert a = new Alert(Alert.AlertType.WARNING, message, ButtonType.OK);
+   private void showAlert(String title, String msg) {
+      Alert a = new Alert(Alert.AlertType.WARNING, msg, ButtonType.OK);
       a.setTitle(title);
       a.setHeaderText(null);
       a.showAndWait();
-   }
-
-   public void shutdown() {
-      // Set flag cancel ke semua item aktif agar loop membaca lebih cepat
-      for (DownloadItem item : items) {
-         if (item.activeTask != null)
-            item.requestCancel();
-      }
-      downloadPool.shutdownNow();
    }
 }
